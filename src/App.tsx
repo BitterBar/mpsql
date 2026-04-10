@@ -20,6 +20,7 @@ import {
 } from "@/components/ui/sidebar";
 import { LogProvider, useLogs } from "@/contexts/LogContext";
 import { ConnectionProvider, useConnection } from "@/contexts/ConnectionContext";
+import { AppStateProvider, useAppState } from "@/contexts/AppStateContext";
 import { DatabaseSelector } from "@/components/database-selector";
 import { LogPanel } from "@/components/log-panel";
 
@@ -371,7 +372,7 @@ function OptimizePage() {
 
 function EnvPage() {
   const { addLog } = useLogs();
-  const [loading, setLoading] = useState(false);
+  const { envLoading, setEnvLoading, setEnvNeedsRefresh } = useAppState();
   const [envInfo, setEnvInfo] = useState<EnvInfo | null>(null);
 
   useEffect(() => {
@@ -388,19 +389,23 @@ function EnvPage() {
   }
 
   async function createEnv() {
-    setLoading(true);
+    setEnvLoading({ isLoading: true, message: "正在创建 GDAL 环境..." });
     addLog("info", "正在创建 GDAL 环境...");
     try {
       await invoke<string>("create_env", {
-        packages: ["gdal", "libpq", "postgresql"],
+        packages: ["gdal", "libpq", "libgdal-pg"],
       });
       await checkEnvStatus();
       addLog("success", "环境创建完成");
+      setEnvLoading({ isLoading: false, message: "" });
+      setEnvNeedsRefresh(true);
     } catch (e) {
       addLog("error", "环境创建失败", String(e));
+      setEnvLoading({ isLoading: false, message: String(e) });
     }
-    setLoading(false);
   }
+
+  const loading = envLoading.isLoading;
 
   return (
     <Card>
@@ -482,6 +487,7 @@ function HelpPage() {
 function AppContent() {
   const location = useLocation();
   const navigate = useNavigate();
+  const { envNeedsRefresh, setEnvNeedsRefresh } = useAppState();
   const [envInfo, setEnvInfo] = useState<EnvInfo | null>(null);
   const [gdalInstalled, setGdalInstalled] = useState(false);
 
@@ -498,6 +504,8 @@ function AppContent() {
         } catch {
           setGdalInstalled(false);
         }
+      } else {
+        setGdalInstalled(false);
       }
     } catch (e) {
       console.error("检查环境状态失败:", e);
@@ -507,6 +515,13 @@ function AppContent() {
   useEffect(() => {
     checkEnvStatus();
   }, []);
+
+  useEffect(() => {
+    if (envNeedsRefresh) {
+      checkEnvStatus();
+      setEnvNeedsRefresh(false);
+    }
+  }, [envNeedsRefresh]);
 
   return (
     <>
@@ -544,11 +559,13 @@ function AppContent() {
 function App() {
   return (
     <BrowserRouter>
-      <LogProvider>
-        <ConnectionProvider>
-          <AppContent />
-        </ConnectionProvider>
-      </LogProvider>
+      <AppStateProvider>
+        <LogProvider>
+          <ConnectionProvider>
+            <AppContent />
+          </ConnectionProvider>
+        </LogProvider>
+      </AppStateProvider>
     </BrowserRouter>
   );
 }

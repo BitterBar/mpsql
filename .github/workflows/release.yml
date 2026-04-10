@@ -1,4 +1,5 @@
 name: Release App
+
 on:
   workflow_dispatch: # 支持手动点击按钮触发
   push:
@@ -6,18 +7,31 @@ on:
       - "v*" # 支持推送 v 开头的 tag 触发
 
 jobs:
-  publish:
+  # --- 阶段 1：全局唯一创建 Release (解决并发抢占报错) ---
+  create-release:
+    runs-on: ubuntu-latest
     permissions:
-      contents: write # 赋予 Action 写入 Release 的权限
+      contents: write
+    steps:
+      - name: Create Release Draft
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "App ${{ github.ref_name }}"
+          draft: true
+          prerelease: false
+
+  # --- 阶段 2：并发编译并上传附件 (仅 Windows 和 macOS) ---
+  publish:
+    needs: create-release
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-            args: ""
-          - platform: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
             args: ""
           - platform: macos-latest
             target: x86_64-apple-darwin
@@ -30,11 +44,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 建议使用 v4 版本以更好地配合 Node 24
       - name: setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10 # 你指定的 pnpm 10
+          version: 10
 
       - name: setup node
         uses: actions/setup-node@v4
@@ -52,12 +65,6 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: install dependencies (ubuntu only)
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
-
       - name: install frontend dependencies
         run: pnpm install
 
@@ -66,10 +73,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # --- 核心修改部分 ---
-          tagName: v__VERSION__
-          releaseName: "App v__VERSION__"
-          # ------------------
+          tagName: ${{ github.ref_name }}
+          releaseName: "App ${{ github.ref_name }}"
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}

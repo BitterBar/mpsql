@@ -10,21 +10,6 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_shell::ShellExt;
 use walkdir::WalkDir;
 
-fn is_windows() -> bool {
-    cfg!(target_os = "windows")
-}
-
-fn add_env_var_if_present(args: &mut Vec<String>, var_name: &str, var_value: &Option<String>) {
-    if let Some(ref value) = var_value {
-        if is_windows() {
-            args.push(format!("{}={}", var_name, value));
-        } else {
-            args.push("env".to_string());
-            args.push(format!("{}={}", var_name, value));
-        }
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EnvInfo {
     pub path: String,
@@ -157,14 +142,6 @@ fn get_micromamba_binary_names() -> Vec<&'static str> {
         ("macos", "x86_64") => {
             names.push("micromamba");
             names.push("micromamba_osx_64");
-        }
-        ("linux", "x86_64") => {
-            names.push("micromamba");
-            names.push("micromamba_linux_64");
-        }
-        ("linux", "aarch64") => {
-            names.push("micromamba");
-            names.push("micromamba_linux_64");
         }
         ("windows", _) => {
             names.push("micromamba.exe");
@@ -657,15 +634,17 @@ async fn import_single_file(
             "run".to_string(),
             "-p".to_string(),
             env_path.to_string_lossy().to_string(),
+            "psql".to_string(),
         ];
         
-        add_env_var_if_present(&mut create_args, "PGPASSWORD", &if pg_pass.is_empty() { None } else { Some(pg_pass.to_string()) });
+        if !pg_pass.is_empty() {
+            create_args.push(format!("postgresql://{}:{}@{}:{}/{}", pg_user, pg_pass, pg_host, pg_port, pg_db));
+        } else {
+            create_args.push(format!("postgresql://{}@{}:{}/{}", pg_user, pg_host, pg_port, pg_db));
+        }
         
-        create_args.extend(["psql".to_string(), "-h".to_string(), pg_host.to_string()]);
-        create_args.extend(["-p".to_string(), pg_port.to_string()]);
-        create_args.extend(["-U".to_string(), pg_user.to_string()]);
-        create_args.extend(["-d".to_string(), pg_db.to_string()]);
-        create_args.extend(["-c".to_string(), create_schema_sql]);
+        create_args.push("-c".to_string());
+        create_args.push(create_schema_sql);
         
         let create_output = shell
             .command(micromamba.to_string_lossy().as_ref())
@@ -815,11 +794,21 @@ pub struct OptimizeOptions {
     pub create_geometry_index: bool,
 }
 
-fn parse_pg_connection(conn: &str) -> Result<(String, Option<String>, Vec<String>), String> {
+struct PgConnInfo {
+    host: String,
+    port: String,
+    user: String,
+    db_name: String,
+    password: Option<String>,
+}
+
+fn parse_pg_connection_full(conn: &str) -> Result<PgConnInfo, String> {
     let conn = conn.trim();
+    let mut host = "localhost".to_string();
+    let mut port = "5432".to_string();
+    let mut user = "postgres".to_string();
     let mut db_name = String::new();
     let mut password: Option<String> = None;
-    let mut psql_args = Vec::new();
     
     let parts: Vec<&str> = if conn.starts_with("PG:") {
         conn[3..].split_whitespace().collect()
@@ -827,42 +816,51 @@ fn parse_pg_connection(conn: &str) -> Result<(String, Option<String>, Vec<String
         conn.split_whitespace().collect()
     };
     
-    let mut i = 0;
-    while i < parts.len() {
-        let part = parts[i];
+    for part in parts {
         if let Some((key, value)) = part.split_once('=') {
             match key.to_lowercase().as_str() {
-                "host" => {
-                    psql_args.push("-h".to_string());
-                    psql_args.push(value.to_string());
-                }
-                "port" => {
-                    psql_args.push("-p".to_string());
-                    psql_args.push(value.to_string());
-                }
+                "host" => host = value.to_string(),
+                "port" => port = value.to_string(),
                 "dbname" | "database" => db_name = value.to_string(),
-                "user" | "username" => {
-                    psql_args.push("-U".to_string());
-                    psql_args.push(value.to_string());
-                }
-                "password" => {
-                    password = Some(value.to_string());
-                }
+                "user" | "username" => user = value.to_string(),
+                "password" => password = Some(value.to_string()),
                 _ => {}
             }
-        } else if !part.starts_with('-') && part != "PG:" {
-            if db_name.is_empty() {
+        } else if !part.starts_with('-') && part != "PG:" && !part.contains('=') {
+            if db_name.is_empty() && !part.contains('@') && !part.starts_with("postgresql://") {
                 db_name = part.to_string();
             }
         }
-        i += 1;
     }
     
     if db_name.is_empty() {
         return Err("Database name not found in connection string".to_string());
     }
     
-    Ok((db_name, password, psql_args))
+    Ok(PgConnInfo {
+        host,
+        port,
+        user,
+        db_name,
+        password,
+    })
+}
+
+fn build_conn_url(info: &PgConnInfo) -> String {
+    match &info.password {
+        Some(pwd) if !pwd.is_empty() => {
+            format!(
+                "postgresql://{}:{}@{}:{}/{}",
+                info.user, pwd, info.host, info.port, info.db_name
+            )
+        }
+        _ => {
+            format!(
+                "postgresql://{}@{}:{}/{}",
+                info.user, info.host, info.port, info.db_name
+            )
+        }
+    }
 }
 
 #[tauri::command]
@@ -876,7 +874,7 @@ async fn optimize_postgres(app: tauri::AppHandle, options: OptimizeOptions) -> R
     let micromamba = get_micromamba_path(&app)?;
     let shell = app.shell();
     
-    let (db_name, password, psql_args) = parse_pg_connection(&options.connection)?;
+    let pg_info = parse_pg_connection_full(&options.connection)?;
     
     let schema = options.schema.unwrap_or_else(|| "public".to_string());
     let table = options.table.as_deref();
@@ -896,14 +894,16 @@ async fn optimize_postgres(app: tauri::AppHandle, options: OptimizeOptions) -> R
         }
     );
     
-    let mut analyze_args = vec!["run".to_string(), "-p".to_string(), env_path.to_string_lossy().to_string()];
-    add_env_var_if_present(&mut analyze_args, "PGPASSWORD", &password);
-    analyze_args.push("psql".to_string());
-    analyze_args.extend(psql_args.iter().cloned());
-    analyze_args.push("-d".to_string());
-    analyze_args.push(db_name.clone());
-    analyze_args.push("-c".to_string());
-    analyze_args.push(analyze_sql);
+    let conn_url = build_conn_url(&pg_info);
+    let analyze_args = vec![
+        "run".to_string(),
+        "-p".to_string(),
+        env_path.to_string_lossy().to_string(),
+        "psql".to_string(),
+        conn_url.clone(),
+        "-c".to_string(),
+        analyze_sql,
+    ];
     
     let analyze_output = shell
         .command(micromamba.to_string_lossy().as_ref())
@@ -953,14 +953,15 @@ $$;"#,
             schema = schema, table_filter = table_filter
         );
         
-        let mut geom_args = vec!["run".to_string(), "-p".to_string(), env_path.to_string_lossy().to_string()];
-        add_env_var_if_present(&mut geom_args, "PGPASSWORD", &password);
-        geom_args.push("psql".to_string());
-        geom_args.extend(psql_args.iter().cloned());
-        geom_args.push("-d".to_string());
-        geom_args.push(db_name.clone());
-        geom_args.push("-c".to_string());
-        geom_args.push(geometry_index_sql);
+        let geom_args = vec![
+            "run".to_string(),
+            "-p".to_string(),
+            env_path.to_string_lossy().to_string(),
+            "psql".to_string(),
+            conn_url.clone(),
+            "-c".to_string(),
+            geometry_index_sql,
+        ];
         
         let geom_output = shell
             .command(micromamba.to_string_lossy().as_ref())
@@ -989,14 +990,15 @@ $$;"#,
     
     let vacuum_sql = format!("VACUUM (ANALYZE, VERBOSE) {};", vacuum_table_spec);
     
-    let mut vacuum_args = vec!["run".to_string(), "-p".to_string(), env_path.to_string_lossy().to_string()];
-    add_env_var_if_present(&mut vacuum_args, "PGPASSWORD", &password);
-    vacuum_args.push("psql".to_string());
-    vacuum_args.extend(psql_args.iter().cloned());
-    vacuum_args.push("-d".to_string());
-    vacuum_args.push(db_name);
-    vacuum_args.push("-c".to_string());
-    vacuum_args.push(vacuum_sql);
+    let vacuum_args = vec![
+        "run".to_string(),
+        "-p".to_string(),
+        env_path.to_string_lossy().to_string(),
+        "psql".to_string(),
+        conn_url,
+        "-c".to_string(),
+        vacuum_sql,
+    ];
     
     let vacuum_output = shell
         .command(micromamba.to_string_lossy().as_ref())
