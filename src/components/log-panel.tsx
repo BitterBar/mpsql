@@ -24,7 +24,7 @@ export function LogPanel() {
   if (logs.length === 0) return null;
 
   return (
-    <div className="border-t bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 mt-auto shrink-0">
+    <div className="border-t bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 mt-auto shrink-0 overflow-hidden">
       <div className="flex items-center justify-between px-4 py-1 border-b bg-muted/30">
         <span className="text-xs text-muted-foreground">
           日志 ({logs.length})
@@ -57,13 +57,13 @@ export function LogPanel() {
           {logs.map((log) => (
             <div
               key={log.id}
-              className={`flex items-start gap-2 px-2 py-1 rounded text-xs border ${levelColors[log.level]}`}
+              className={`flex flex-wrap items-start gap-2 px-2 py-1 rounded text-xs border ${levelColors[log.level]}`}
             >
               {levelIcons[log.level]}
               <div className="flex-1 min-w-0">
-                <div className="font-medium">{log.message}</div>
+                <div className="font-medium break-all">{log.message}</div>
                 {log.details && (
-                  <div className="text-muted-foreground truncate">
+                  <div className="text-muted-foreground break-all whitespace-pre-wrap">
                     {log.details}
                   </div>
                 )}
