@@ -10,6 +10,21 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_shell::ShellExt;
 use walkdir::WalkDir;
 
+fn is_windows() -> bool {
+    cfg!(target_os = "windows")
+}
+
+fn add_env_var_if_present(args: &mut Vec<String>, var_name: &str, var_value: &Option<String>) {
+    if let Some(ref value) = var_value {
+        if is_windows() {
+            args.push(format!("{}={}", var_name, value));
+        } else {
+            args.push("env".to_string());
+            args.push(format!("{}={}", var_name, value));
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EnvInfo {
     pub path: String,
@@ -644,10 +659,7 @@ async fn import_single_file(
             env_path.to_string_lossy().to_string(),
         ];
         
-        if !pg_pass.is_empty() {
-            create_args.push("env".to_string());
-            create_args.push(format!("PGPASSWORD={}", pg_pass));
-        }
+        add_env_var_if_present(&mut create_args, "PGPASSWORD", &if pg_pass.is_empty() { None } else { Some(pg_pass.to_string()) });
         
         create_args.extend(["psql".to_string(), "-h".to_string(), pg_host.to_string()]);
         create_args.extend(["-p".to_string(), pg_port.to_string()]);
@@ -885,10 +897,7 @@ async fn optimize_postgres(app: tauri::AppHandle, options: OptimizeOptions) -> R
     );
     
     let mut analyze_args = vec!["run".to_string(), "-p".to_string(), env_path.to_string_lossy().to_string()];
-    if let Some(pwd) = &password {
-        analyze_args.push("env".to_string());
-        analyze_args.push(format!("PGPASSWORD={}", pwd));
-    }
+    add_env_var_if_present(&mut analyze_args, "PGPASSWORD", &password);
     analyze_args.push("psql".to_string());
     analyze_args.extend(psql_args.iter().cloned());
     analyze_args.push("-d".to_string());
@@ -945,10 +954,7 @@ $$;"#,
         );
         
         let mut geom_args = vec!["run".to_string(), "-p".to_string(), env_path.to_string_lossy().to_string()];
-        if let Some(pwd) = &password {
-            geom_args.push("env".to_string());
-            geom_args.push(format!("PGPASSWORD={}", pwd));
-        }
+        add_env_var_if_present(&mut geom_args, "PGPASSWORD", &password);
         geom_args.push("psql".to_string());
         geom_args.extend(psql_args.iter().cloned());
         geom_args.push("-d".to_string());
@@ -984,10 +990,7 @@ $$;"#,
     let vacuum_sql = format!("VACUUM (ANALYZE, VERBOSE) {};", vacuum_table_spec);
     
     let mut vacuum_args = vec!["run".to_string(), "-p".to_string(), env_path.to_string_lossy().to_string()];
-    if let Some(pwd) = &password {
-        vacuum_args.push("env".to_string());
-        vacuum_args.push(format!("PGPASSWORD={}", pwd));
-    }
+    add_env_var_if_present(&mut vacuum_args, "PGPASSWORD", &password);
     vacuum_args.push("psql".to_string());
     vacuum_args.extend(psql_args.iter().cloned());
     vacuum_args.push("-d".to_string());
