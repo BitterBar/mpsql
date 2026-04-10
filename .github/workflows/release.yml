@@ -17,7 +17,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: "App ${{ github.ref_name }}"
+          name: "${{ github.ref_name }}"
           draft: true
           prerelease: false
 
