@@ -49,7 +49,7 @@ jobs:
 
       # 5. 构建并发布 (适配 Tauri v2)
       - name: build and release
-        uses: tauri-apps/tauri-action@v2
+        uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
