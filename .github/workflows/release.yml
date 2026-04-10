@@ -1,0 +1,16 @@
+jobs:
+  publish:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest, macos-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: build app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: "App v__VERSION__"
