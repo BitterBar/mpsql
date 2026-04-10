@@ -33,13 +33,6 @@
     ],
     "resources": {
       "binaries/*": "binaries/"
-    },
-    "windows": {
-      "nsis": {
-        "oneClick": false,
-        "perMachine": true,
-        "allowElevation": true
-      }
     }
   }
 }
