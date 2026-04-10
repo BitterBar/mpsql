@@ -91,13 +91,11 @@ function ImportPage() {
     setLoading(true);
     addLog("info", "开始导入数据...", inputPath);
 
-    const connStr = `PG:host=${selectedConnection.host} port=${selectedConnection.port} dbname=${selectedConnection.database} user=${selectedConnection.user} password=${selectedConnection.password}`;
-
     try {
       const result = await invoke<string>("ogr_convert", {
         options: {
           input_path: inputPath,
-          output_connection: connStr,
+          output_connection: selectedConnection,
           layer_name: layerName || null,
           srs: sourceSrs || null,
           target_srs: targetSrs || null,
@@ -311,12 +309,10 @@ function OptimizePage() {
     setLoading(true);
     addLog("info", "开始优化数据库...", optimizeSchema);
 
-    const connStr = `PG:host=${selectedConnection.host} port=${selectedConnection.port} dbname=${selectedConnection.database} user=${selectedConnection.user} password=${selectedConnection.password}`;
-
     try {
       const result = await invoke<string>("optimize_postgres", {
         options: {
-          connection: connStr,
+          connection: selectedConnection,
           schema: optimizeSchema || null,
           table: optimizeTable || null,
           create_geometry_index: createGeomIndex,
