@@ -1,16 +1,59 @@
+name: Release App
+on:
+  workflow_dispatch: # 手动触发
+  push:
+    tags:
+      - 'v*' # 推送 v 开头的 Tag 触发
+
 jobs:
   publish:
+    permissions:
+      contents: write # 必须的 Release 写入权限
     strategy:
       fail-fast: false
       matrix:
         platform: [windows-latest, macos-latest, ubuntu-22.04]
+
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
-      - name: build app
-        uses: tauri-apps/tauri-action@v0
+
+      # 1. 准备 Node 环境并安装 pnpm (如果你用 npm，可以去掉 pnpm 这一步)
+      - name: setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 8
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      # 2. 准备 Rust 环境
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      # 缓存 Rust 构建产物，大幅加快后续打包速度
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2 
+
+      # 3. Linux 专属依赖 (注意：这里使用的是 Tauri v2 对应的 4.1-dev)
+      - name: install dependencies (ubuntu only)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+
+      # 4. 安装前端依赖
+      - name: install frontend dependencies
+        run: pnpm install
+
+      # 5. 构建并发布 (适配 Tauri v2)
+      - name: build and release
+        uses: tauri-apps/tauri-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: v__VERSION__
-          releaseName: "App v__VERSION__"
+          # 不再硬编码 tagName，让 Action 自动读取项目版本号
+          releaseBody: "See the assets below to download the latest version."
+          releaseDraft: true
+          prerelease: false
