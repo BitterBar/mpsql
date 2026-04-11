@@ -360,7 +360,24 @@ async fn create_env(app: tauri::AppHandle, packages: Vec<String>) -> Result<Stri
     let micromamba = get_micromamba_path(&app)?;
 
     if env_path.exists() {
-        remove_dir_all_force(&env_path).map_err(|e| e.to_string())?;
+        // 先尝试重命名旧目录：即使目录内有被进程锁定的 DLL，Windows 也允许重命名
+        // 重命名成功后，env_path 立即空出，可以创建新环境，旧目录在后台尽力清理
+        let old_path = env_path.with_file_name("gis_env_old");
+        // 如果上次残留了 gis_env_old，先尝试清理
+        if old_path.exists() {
+            let _ = remove_dir_all_force(&old_path);
+        }
+        match fs::rename(&env_path, &old_path) {
+            Ok(_) => {
+                eprintln!("[create_env] 旧环境已重命名为 {:?}，后台清理中", old_path);
+                // 后台尽力删除，失败不影响新环境创建
+                let _ = remove_dir_all_force(&old_path);
+            }
+            Err(e) => {
+                eprintln!("[create_env] 重命名失败 ({})，尝试直接删除", e);
+                remove_dir_all_force(&env_path).map_err(|e| e.to_string())?;
+            }
+        }
     }
 
     let shell = app.shell();
