@@ -5,79 +5,6 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_shell::ShellExt;
 
-/// 强制删除目录，处理 Windows 上的只读文件和 junction point 权限问题
-fn remove_dir_all_force(path: &Path) -> std::io::Result<()> {
-    eprintln!("[remove_dir_all_force] 进入目录: {:?}", path);
-
-    let read_dir = fs::read_dir(path).map_err(|e| {
-        eprintln!("[remove_dir_all_force] read_dir 失败: {:?} — {}", path, e);
-        e
-    })?;
-
-    for entry in read_dir {
-        let entry = entry.map_err(|e| {
-            eprintln!("[remove_dir_all_force] 读取 entry 失败 in {:?} — {}", path, e);
-            e
-        })?;
-        let entry_path = entry.path();
-        let file_type = entry.file_type().map_err(|e| {
-            eprintln!("[remove_dir_all_force] file_type 失败: {:?} — {}", entry_path, e);
-            e
-        })?;
-
-        eprintln!(
-            "[remove_dir_all_force] entry: {:?}  is_dir={} is_file={} is_symlink={}",
-            entry_path,
-            file_type.is_dir(),
-            file_type.is_file(),
-            file_type.is_symlink()
-        );
-
-        if file_type.is_symlink() {
-            // 符号链接（含指向目录的链接）和 Windows junction point
-            // Unix: 无论指向目录还是文件，都用 remove_file 删除链接本身
-            // Windows junction: is_symlink() 返回 true，用 remove_dir 删除 junction 节点
-            #[cfg(windows)]
-            let remove_result = if entry_path.is_dir() {
-                eprintln!("[remove_dir_all_force] remove_dir (junction): {:?}", entry_path);
-                fs::remove_dir(&entry_path)
-            } else {
-                eprintln!("[remove_dir_all_force] remove_file (symlink): {:?}", entry_path);
-                fs::remove_file(&entry_path)
-            };
-            #[cfg(not(windows))]
-            let remove_result = {
-                eprintln!("[remove_dir_all_force] remove_file (symlink): {:?}", entry_path);
-                fs::remove_file(&entry_path)
-            };
-            remove_result.map_err(|e| {
-                eprintln!("[remove_dir_all_force] 删除符号链接失败: {:?} — {}", entry_path, e);
-                e
-            })?;
-        } else if file_type.is_dir() {
-            remove_dir_all_force(&entry_path)?;
-        } else {
-            // 先移除只读属性再删除
-            if let Ok(meta) = fs::metadata(&entry_path) {
-                let mut perms = meta.permissions();
-                #[allow(clippy::permissions_set_readonly_false)]
-                perms.set_readonly(false);
-                let _ = fs::set_permissions(&entry_path, perms);
-            }
-            eprintln!("[remove_dir_all_force] remove_file: {:?}", entry_path);
-            fs::remove_file(&entry_path).map_err(|e| {
-                eprintln!("[remove_dir_all_force] remove_file 失败: {:?} — {}", entry_path, e);
-                e
-            })?;
-        }
-    }
-
-    eprintln!("[remove_dir_all_force] remove_dir (最终): {:?}", path);
-    fs::remove_dir(path).map_err(|e| {
-        eprintln!("[remove_dir_all_force] remove_dir 失败: {:?} — {}", path, e);
-        e
-    })
-}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EnvInfo {
@@ -359,28 +286,23 @@ async fn create_env(app: tauri::AppHandle, packages: Vec<String>) -> Result<Stri
     let env_path = get_env_path(&app)?;
     let micromamba = get_micromamba_path(&app)?;
 
+    let shell = app.shell();
+
     if env_path.exists() {
-        // 先尝试重命名旧目录：即使目录内有被进程锁定的 DLL，Windows 也允许重命名
-        // 重命名成功后，env_path 立即空出，可以创建新环境，旧目录在后台尽力清理
-        let old_path = env_path.with_file_name("gis_env_old");
-        // 如果上次残留了 gis_env_old，先尝试清理
-        if old_path.exists() {
-            let _ = remove_dir_all_force(&old_path);
-        }
-        match fs::rename(&env_path, &old_path) {
-            Ok(_) => {
-                eprintln!("[create_env] 旧环境已重命名为 {:?}，后台清理中", old_path);
-                // 后台尽力删除，失败不影响新环境创建
-                let _ = remove_dir_all_force(&old_path);
-            }
-            Err(e) => {
-                eprintln!("[create_env] 重命名失败 ({})，尝试直接删除", e);
-                remove_dir_all_force(&env_path).map_err(|e| e.to_string())?;
-            }
+        // 让 micromamba 自己清理旧环境，它比手动删除更可靠
+        let env_path_str = env_path.to_string_lossy().to_string();
+        let remove_output = shell
+            .command(micromamba.to_string_lossy().as_ref())
+            .args(["env", "remove", "-p", &env_path_str, "-y"])
+            .output()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !remove_output.status.success() {
+            let stderr = String::from_utf8_lossy(&remove_output.stderr).to_string();
+            return Err(format!("删除旧环境失败:\n{}", stderr));
         }
     }
-
-    let shell = app.shell();
 
     let env_path_str = env_path.to_string_lossy().to_string();
     let mut all_args: Vec<&str> = vec!["create", "-p", &env_path_str, "-c", "conda-forge"];
