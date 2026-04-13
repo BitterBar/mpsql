@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fs;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_shell::ShellExt;
 
+// ─── Data structures ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EnvInfo {
@@ -36,6 +38,8 @@ impl Default for DbConnectionList {
         }
     }
 }
+
+// ─── Config / connection storage ─────────────────────────────────────────────
 
 fn get_config_path(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
@@ -85,7 +89,6 @@ fn save_connection(app: tauri::AppHandle, connection: DbConnection) -> Result<()
 #[tauri::command]
 fn test_connection(connection: DbConnection) -> Result<String, String> {
     let port: u16 = connection.port.parse().unwrap_or(5432);
-
     let addr = (connection.host.as_str(), port);
 
     match addr.to_socket_addrs() {
@@ -93,8 +96,10 @@ fn test_connection(connection: DbConnection) -> Result<String, String> {
             let mut success = false;
             let mut last_err = String::new();
             for addr in addrs {
-                match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))
-                {
+                match std::net::TcpStream::connect_timeout(
+                    &addr,
+                    std::time::Duration::from_secs(5),
+                ) {
                     Ok(_) => {
                         success = true;
                         break;
@@ -129,6 +134,8 @@ fn delete_connection(app: tauri::AppHandle, id: String) -> Result<(), String> {
     }
     Ok(())
 }
+
+// ─── Micromamba / env discovery ───────────────────────────────────────────────
 
 fn get_micromamba_binary_names() -> Vec<&'static str> {
     let target_os = std::env::consts::OS;
@@ -202,10 +209,15 @@ fn get_env_path(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn env_executable_dirs(env_path: &Path) -> Vec<PathBuf> {
     if cfg!(target_os = "windows") {
+        // Matches the order that `conda activate` uses on Windows.
+        // Library/mingw-w64/bin and Library/usr/bin must be in PATH so that
+        // DLLs depended on by GDAL (including libpq) are found at load time.
         vec![
             env_path.to_path_buf(),
-            env_path.join("Scripts"),
+            env_path.join("Library").join("mingw-w64").join("bin"),
+            env_path.join("Library").join("usr").join("bin"),
             env_path.join("Library").join("bin"),
+            env_path.join("Scripts"),
             env_path.join("bin"),
         ]
     } else {
@@ -243,14 +255,135 @@ fn find_env_executable(env_path: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-fn micromamba_run_args(env_path: &Path, program: &str) -> Vec<String> {
-    vec![
-        "run".to_string(),
-        "-p".to_string(),
-        env_path.to_string_lossy().to_string(),
-        program.to_string(),
-    ]
+// ─── Process execution helpers ────────────────────────────────────────────────
+
+/// Build the environment variables needed to run a tool from the conda env
+/// directly (without `micromamba run`). Prepends the env's bin directories to
+/// PATH and sets GDAL_DATA / PROJ_DATA so GDAL can locate its support files.
+fn get_conda_env_vars(env_path: &Path) -> Vec<(OsString, OsString)> {
+    let mut vars: Vec<(OsString, OsString)> = Vec::new();
+
+    // ── PATH ──────────────────────────────────────────────────────────────────
+    let env_dirs = env_executable_dirs(env_path);
+    let current_path = std::env::var_os("PATH").unwrap_or_default();
+
+    let mut path_parts: Vec<PathBuf> = env_dirs.clone();
+    for part in std::env::split_paths(&current_path) {
+        path_parts.push(part);
+    }
+
+    if let Ok(new_path) = std::env::join_paths(path_parts) {
+        vars.push((OsString::from("PATH"), new_path));
+    }
+
+    // ── GDAL_DATA ─────────────────────────────────────────────────────────────
+    let gdal_data = if cfg!(target_os = "windows") {
+        env_path.join("Library").join("share").join("gdal")
+    } else {
+        env_path.join("share").join("gdal")
+    };
+    if gdal_data.exists() {
+        vars.push((OsString::from("GDAL_DATA"), gdal_data.into_os_string()));
+    }
+
+    // ── PROJ_DATA / PROJ_LIB ──────────────────────────────────────────────────
+    let proj_data = if cfg!(target_os = "windows") {
+        env_path.join("Library").join("share").join("proj")
+    } else {
+        env_path.join("share").join("proj")
+    };
+    if proj_data.exists() {
+        vars.push((
+            OsString::from("PROJ_DATA"),
+            proj_data.clone().into_os_string(),
+        ));
+        vars.push((OsString::from("PROJ_LIB"), proj_data.into_os_string()));
+    }
+
+    // ── GDAL_DRIVER_PATH ──────────────────────────────────────────────────────
+    // Required so GDAL can find plugin drivers (e.g. the PostgreSQL OGR driver)
+    // that are compiled as shared libraries rather than built into gdal.dll.
+    let gdal_plugins = if cfg!(target_os = "windows") {
+        env_path.join("Library").join("lib").join("gdalplugins")
+    } else {
+        env_path.join("lib").join("gdalplugins")
+    };
+    if gdal_plugins.exists() {
+        vars.push((
+            OsString::from("GDAL_DRIVER_PATH"),
+            gdal_plugins.into_os_string(),
+        ));
+    }
+
+    vars
 }
+
+/// Apply CREATE_NO_WINDOW flag on Windows so child processes don't flash a
+/// console. This is a no-op on other platforms.
+#[cfg(target_os = "windows")]
+fn no_window(cmd: &mut tokio::process::Command) {
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+}
+
+#[cfg(not(target_os = "windows"))]
+fn no_window(_cmd: &mut tokio::process::Command) {}
+
+/// Run a program from the conda env by path, with env vars injected.
+async fn spawn_direct(program: &Path, args: &[OsString], env_vars: &[(OsString, OsString)]) -> std::io::Result<Output> {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args);
+    cmd.envs(env_vars.iter().map(|(k, v)| (k.as_os_str(), v.as_os_str())));
+    no_window(&mut cmd);
+    cmd.output().await
+}
+
+/// Run a micromamba management command (create / env remove / …).
+/// These operate on the micromamba binary itself, not inside the conda env.
+async fn run_micromamba(micromamba: &Path, args: &[OsString]) -> Result<Output, String> {
+    let mut cmd = tokio::process::Command::new(micromamba);
+    cmd.args(args);
+    no_window(&mut cmd);
+    cmd.output().await.map_err(|e| e.to_string())
+}
+
+/// Run `program_name` inside the conda env at `env_path`.
+///
+/// Strategy:
+/// 1. Look up the binary directly via `find_env_executable` and run it with
+///    the appropriate env vars — no shell involved on any platform.
+/// 2. If the binary is not found on disk (env not yet fully populated), fall
+///    back to `micromamba run -p <env_path> <program> <args>`.
+async fn run_in_env(
+    env_path: &Path,
+    micromamba: &Path,
+    program_name: &str,
+    args: &[OsString],
+) -> Result<Output, String> {
+    if let Some(program_path) = find_env_executable(env_path, program_name) {
+        let env_vars = get_conda_env_vars(env_path);
+        return spawn_direct(&program_path, args, &env_vars)
+            .await
+            .map_err(|e| format!("Failed to run {}: {}", program_name, e));
+    }
+
+    // Fallback: micromamba run
+    let mut full_args: Vec<OsString> = vec![
+        OsString::from("run"),
+        OsString::from("-p"),
+        env_path.as_os_str().to_owned(),
+        OsString::from(program_name),
+    ];
+    full_args.extend_from_slice(args);
+
+    let mut cmd = tokio::process::Command::new(micromamba);
+    cmd.args(&full_args);
+    no_window(&mut cmd);
+    cmd.output()
+        .await
+        .map_err(|e| format!("Failed to run {} via micromamba: {}", program_name, e))
+}
+
+// ─── Tauri commands ───────────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn check_env_status(app: tauri::AppHandle) -> Result<EnvInfo, String> {
@@ -286,17 +419,18 @@ async fn create_env(app: tauri::AppHandle, packages: Vec<String>) -> Result<Stri
     let env_path = get_env_path(&app)?;
     let micromamba = get_micromamba_path(&app)?;
 
-    let shell = app.shell();
-
     if env_path.exists() {
-        // 让 micromamba 自己清理旧环境，它比手动删除更可靠
-        let env_path_str = env_path.to_string_lossy().to_string();
-        let remove_output = shell
-            .command(micromamba.to_string_lossy().as_ref())
-            .args(["env", "remove", "-p", &env_path_str, "-y"])
-            .output()
-            .await
-            .map_err(|e| e.to_string())?;
+        let remove_output = run_micromamba(
+            &micromamba,
+            &[
+                OsString::from("env"),
+                OsString::from("remove"),
+                OsString::from("-p"),
+                env_path.as_os_str().to_owned(),
+                OsString::from("-y"),
+            ],
+        )
+        .await?;
 
         if !remove_output.status.success() {
             let stderr = String::from_utf8_lossy(&remove_output.stderr).to_string();
@@ -304,19 +438,19 @@ async fn create_env(app: tauri::AppHandle, packages: Vec<String>) -> Result<Stri
         }
     }
 
-    let env_path_str = env_path.to_string_lossy().to_string();
-    let mut all_args: Vec<&str> = vec!["create", "-p", &env_path_str, "-c", "conda-forge"];
+    let mut create_args: Vec<OsString> = vec![
+        OsString::from("create"),
+        OsString::from("-p"),
+        env_path.as_os_str().to_owned(),
+        OsString::from("-c"),
+        OsString::from("conda-forge"),
+    ];
     for pkg in &packages {
-        all_args.push(pkg);
+        create_args.push(OsString::from(pkg));
     }
-    all_args.push("-y");
+    create_args.push(OsString::from("-y"));
 
-    let output = shell
-        .command(micromamba.to_string_lossy().as_ref())
-        .args(&all_args)
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
+    let output = run_micromamba(&micromamba, &create_args).await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -354,30 +488,13 @@ async fn check_gdal(app: tauri::AppHandle) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let gdalinfo_path = find_env_executable(&env_path, "gdalinfo");
-    let shell = app.shell();
-
-    if let Some(gdalinfo_path) = gdalinfo_path {
-        if let Ok(output) = shell
-            .command(gdalinfo_path.to_string_lossy().as_ref())
-            .args(["--version"])
-            .output()
-            .await
-        {
-            if output.status.success() {
-                return Ok(true);
-            }
-        }
-    }
-
-    let mut args = micromamba_run_args(&env_path, "gdalinfo");
-    args.push("--version".to_string());
-
-    let output = shell
-        .command(micromamba.to_string_lossy().as_ref())
-        .args(args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-        .output()
-        .await;
+    let output = run_in_env(
+        &env_path,
+        &micromamba,
+        "gdalinfo",
+        &[OsString::from("--version")],
+    )
+    .await;
 
     match output {
         Ok(out) => Ok(out.status.success()),
@@ -415,7 +532,7 @@ async fn ogr_convert(app: tauri::AppHandle, options: OgrConvertOptions) -> Resul
     let input_path = std::path::Path::new(&options.input_path);
     let is_directory = input_path.is_dir();
 
-    let files_to_import: Vec<std::path::PathBuf> = if is_directory {
+    let files_to_import: Vec<PathBuf> = if is_directory {
         let mut files = Vec::new();
         if let Ok(entries) = std::fs::read_dir(input_path) {
             for entry in entries.flatten() {
@@ -458,8 +575,7 @@ async fn ogr_convert(app: tauri::AppHandle, options: OgrConvertOptions) -> Resul
             },
         );
 
-        match import_single_file(&app, &env_path, &micromamba, &options, file_path, &pg_info).await
-        {
+        match import_single_file(&env_path, &micromamba, &options, file_path, &pg_info).await {
             Ok(msg) => {
                 results.push(format!("✓ {}: {}", file_name, msg));
                 success_count += 1;
@@ -483,7 +599,6 @@ async fn ogr_convert(app: tauri::AppHandle, options: OgrConvertOptions) -> Resul
 }
 
 async fn import_single_file(
-    app: &AppHandle,
     env_path: &PathBuf,
     micromamba: &PathBuf,
     options: &OgrConvertOptions,
@@ -492,24 +607,20 @@ async fn import_single_file(
 ) -> Result<String, String> {
     let final_conn = build_libpq_conn_string(pg_info);
 
-    let schema = options.schema.as_ref();
-    if let Some(ref schema_name) = schema {
+    // Create schema if needed
+    if let Some(ref schema_name) = options.schema {
         let create_schema_sql = format!(
             "CREATE SCHEMA IF NOT EXISTS {};",
             quote_sql_identifier(schema_name)
         );
 
-        let shell = app.shell();
-        let mut create_args = micromamba_run_args(env_path, "psql");
-        create_args.push(final_conn.clone());
+        let psql_args: Vec<OsString> = vec![
+            OsString::from(&final_conn),
+            OsString::from("-c"),
+            OsString::from(&create_schema_sql),
+        ];
 
-        create_args.push("-c".to_string());
-        create_args.push(create_schema_sql);
-
-        let create_output = shell
-            .command(micromamba.to_string_lossy().as_ref())
-            .args(create_args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-            .output()
+        let create_output = run_in_env(env_path, micromamba, "psql", &psql_args)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -535,77 +646,73 @@ async fn import_single_file(
             options.layer_name.clone()
         };
 
-    let mut args = micromamba_run_args(env_path, "ogr2ogr");
-    args.push("-f".to_string());
-    args.push("PostgreSQL".to_string());
-    args.push(format!("PG:{}", final_conn));
+    let mut args: Vec<OsString> = vec![
+        OsString::from("-f"),
+        OsString::from("PostgreSQL"),
+        OsString::from(format!("PG:{}", final_conn)),
+    ];
 
     if let Some(ref table) = target_table {
-        args.push("-nln".to_string());
-        args.push(table.clone());
+        args.push(OsString::from("-nln"));
+        args.push(OsString::from(table));
     }
 
     if options.promote_to_multi {
-        args.push("-nlt".to_string());
-        args.push("PROMOTE_TO_MULTI".to_string());
+        args.push(OsString::from("-nlt"));
+        args.push(OsString::from("PROMOTE_TO_MULTI"));
     }
 
     if let Some(ref geom_name) = options.geometry_name {
-        args.push("-lco".to_string());
-        args.push(format!("GEOMETRY_NAME={}", geom_name));
+        args.push(OsString::from("-lco"));
+        args.push(OsString::from(format!("GEOMETRY_NAME={}", geom_name)));
     }
 
     if let Some(ref fid) = options.fid_column {
-        args.push("-lco".to_string());
-        args.push(format!("FID={}", fid));
+        args.push(OsString::from("-lco"));
+        args.push(OsString::from(format!("FID={}", fid)));
     }
 
     if options.overwrite {
-        args.push("-overwrite".to_string());
+        args.push(OsString::from("-overwrite"));
     }
 
     if options.skip_failures {
-        args.push("-skipfailures".to_string());
+        args.push(OsString::from("-skipfailures"));
     }
 
     if let Some(ref srs) = options.srs {
-        args.push("-s_srs".to_string());
-        args.push(srs.clone());
+        args.push(OsString::from("-s_srs"));
+        args.push(OsString::from(srs));
     }
 
     if let Some(ref srs) = options.target_srs {
-        args.push("-t_srs".to_string());
-        args.push(srs.clone());
+        args.push(OsString::from("-t_srs"));
+        args.push(OsString::from(srs));
     }
 
     if let Some(ref fields) = options.select_fields {
         if !fields.is_empty() {
-            args.push("-select".to_string());
-            args.push(fields.clone());
+            args.push(OsString::from("-select"));
+            args.push(OsString::from(fields));
         }
     }
 
     if options.use_copy {
-        args.push("--config".to_string());
-        args.push("PG_USE_COPY".to_string());
-        args.push("YES".to_string());
+        args.push(OsString::from("--config"));
+        args.push(OsString::from("PG_USE_COPY"));
+        args.push(OsString::from("YES"));
     }
 
     if let Some(ref enc) = options.encoding {
-        args.push("--config".to_string());
-        args.push("SHAPE_ENCODING".to_string());
-        args.push(enc.clone());
+        args.push(OsString::from("--config"));
+        args.push(OsString::from("SHAPE_ENCODING"));
+        args.push(OsString::from(enc));
     }
 
-    args.push(input_file.to_string_lossy().to_string());
+    // Pass the input file path as OsString to preserve non-ASCII characters
+    args.push(input_file.as_os_str().to_owned());
 
-    let shell = app.shell();
-    let output = shell
-        .command(micromamba.to_string_lossy().as_ref())
-        .args(args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
+    let output = run_in_env(env_path, micromamba, "ogr2ogr", &args).await?;
 
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).to_string());
@@ -777,9 +884,9 @@ async fn optimize_postgres(
     }
 
     let micromamba = get_micromamba_path(&app)?;
-    let shell = app.shell();
 
     let pg_info = pg_conn_info_from_connection(&options.connection)?;
+    let conn_str = build_libpq_conn_string(&pg_info);
 
     let schema = options.schema.unwrap_or_else(|| "public".to_string());
     let table = options.table.as_deref();
@@ -793,28 +900,19 @@ async fn optimize_postgres(
         },
     );
 
+    // ── ANALYZE ───────────────────────────────────────────────────────────────
     let analyze_sql = build_analyze_sql(&schema, table);
-    let conn_info = build_libpq_conn_string(&pg_info);
-    let mut analyze_args = micromamba_run_args(&env_path, "psql");
-    analyze_args.push(conn_info.clone());
-    analyze_args.push("-c".to_string());
-    analyze_args.push(analyze_sql);
+    let analyze_args: Vec<OsString> = vec![
+        OsString::from(&conn_str),
+        OsString::from("-c"),
+        OsString::from(&analyze_sql),
+    ];
 
-    let analyze_output = shell
-        .command(micromamba.to_string_lossy().as_ref())
-        .args(analyze_args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
-
+    let analyze_output = run_in_env(&env_path, &micromamba, "psql", &analyze_args).await?;
     let analyze_stderr = String::from_utf8_lossy(&analyze_output.stderr).to_string();
     results.push(format!(
         "ANALYZE: {}{}",
-        if analyze_output.status.success() {
-            "SUCCESS"
-        } else {
-            "FAILED"
-        },
+        if analyze_output.status.success() { "SUCCESS" } else { "FAILED" },
         if !analyze_stderr.is_empty() {
             format!("\n  Error: {}", analyze_stderr.trim())
         } else {
@@ -830,29 +928,20 @@ async fn optimize_postgres(
         },
     );
 
+    // ── Geometry indexes ──────────────────────────────────────────────────────
     if options.create_geometry_index {
         let geometry_index_sql = build_geometry_index_sql(&schema, table);
+        let geom_args: Vec<OsString> = vec![
+            OsString::from(&conn_str),
+            OsString::from("-c"),
+            OsString::from(&geometry_index_sql),
+        ];
 
-        let mut geom_args = micromamba_run_args(&env_path, "psql");
-        geom_args.push(conn_info.clone());
-        geom_args.push("-c".to_string());
-        geom_args.push(geometry_index_sql);
-
-        let geom_output = shell
-            .command(micromamba.to_string_lossy().as_ref())
-            .args(geom_args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-            .output()
-            .await
-            .map_err(|e| e.to_string())?;
-
+        let geom_output = run_in_env(&env_path, &micromamba, "psql", &geom_args).await?;
         let geom_stderr = String::from_utf8_lossy(&geom_output.stderr).to_string();
         results.push(format!(
             "Geometry Index Creation: {}{}",
-            if geom_output.status.success() {
-                "SUCCESS"
-            } else {
-                "FAILED"
-            },
+            if geom_output.status.success() { "SUCCESS" } else { "FAILED" },
             if !geom_stderr.is_empty() {
                 format!("\n  Error: {}", geom_stderr.trim())
             } else {
@@ -869,28 +958,19 @@ async fn optimize_postgres(
         );
     }
 
+    // ── VACUUM ────────────────────────────────────────────────────────────────
     let vacuum_sql = build_vacuum_sql(&schema, table);
+    let vacuum_args: Vec<OsString> = vec![
+        OsString::from(&conn_str),
+        OsString::from("-c"),
+        OsString::from(&vacuum_sql),
+    ];
 
-    let mut vacuum_args = micromamba_run_args(&env_path, "psql");
-    vacuum_args.push(conn_info);
-    vacuum_args.push("-c".to_string());
-    vacuum_args.push(vacuum_sql);
-
-    let vacuum_output = shell
-        .command(micromamba.to_string_lossy().as_ref())
-        .args(vacuum_args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
-
+    let vacuum_output = run_in_env(&env_path, &micromamba, "psql", &vacuum_args).await?;
     let vacuum_stderr = String::from_utf8_lossy(&vacuum_output.stderr).to_string();
     results.push(format!(
         "VACUUM ANALYZE: {}{}",
-        if vacuum_output.status.success() {
-            "SUCCESS"
-        } else {
-            "FAILED"
-        },
+        if vacuum_output.status.success() { "SUCCESS" } else { "FAILED" },
         if !vacuum_stderr.is_empty() {
             format!("\n  Error: {}", vacuum_stderr.trim())
         } else {
@@ -920,10 +1000,11 @@ async fn optimize_postgres(
     ))
 }
 
+// ─── App entry point ──────────────────────────────────────────────────────────
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             check_env_status,

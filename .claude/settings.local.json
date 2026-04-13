@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check:*)",
+      "Bash(cargo clean:*)",
+      "Bash(taskkill /F /IM mpsql.exe)",
+      "Bash(taskkill /F /IM micromamba_win_64.exe)",
+      "Bash(tasklist /FI \"IMAGENAME eq mpsql.exe\")",
+      "Bash(tasklist /FI \"IMAGENAME eq micromamba*\")",
+      "Bash(powershell:*)"
+    ]
+  }
+}
